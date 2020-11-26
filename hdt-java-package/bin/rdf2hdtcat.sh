@@ -3,7 +3,7 @@
 function showhelp {
 	echo
 	echo "Script to serialize a big RDF file in n-triples format into HDT"
-	echo "It splits the file in N parts, compress each one with rdf2hdt, and merges them iteratively with hdtCat."
+	echo "It splits the file in 2^N parts, compress each one with rdf2hdt, and merges them iteratively with hdtCat."
 	echo
 	echo "Usage $0 [OPTION]"
 	echo
@@ -14,6 +14,8 @@ function showhelp {
     echo "  -o, --output    output file (output.hdt by default)"
     echo "  -p, --parallel  number of threads to serialize RDF into HDT in parallel (1 by default)"
     echo "  -r, --rdf2hdt   location of rdf2hdt script (assuming it's in PATH by default)"
+    echo "  -z, --compress  use Gzip (for input and splits; default false)"
+    echo "  -g, --gzip      gzip binary (default gzip, can be other e.g. pigz)"
 	echo
 }
 
@@ -25,12 +27,14 @@ declare -i lines
 declare output="output.hdt"
 declare -i splits=2
 declare -i threads=1
+declare compress=""
+declare gzip="gzip"
 
 getopt --test > /dev/null
 if [[ $? -eq 4 ]]; then
     # enhanced getopt works
-    OPTIONS=c:i:hn:o:p:r:
-    LONGOPTIONS=cat:,input:,help,number:,output:,parallel:,rdf2hdt:
+    OPTIONS=c:i:hn:o:p:r:zg:
+    LONGOPTIONS=cat:,input:,help,number:,output:,parallel:,rdf2hdt,compress,gzip
     COMMAND=$(getopt -o $OPTIONS -l $LONGOPTIONS -n "$0" -- "$@")
     if [[ $? -ne 0 ]]; then
     	exit 2
@@ -51,7 +55,7 @@ while true; do
             shift 2
             ;;
 		-n|--number)
-			splits=$2
+			splits=2**$2
 			shift 2
 			;;
         -o|--output)
@@ -66,6 +70,14 @@ while true; do
             rdf2hdt=$2
             shift 2
             ;;
+        -z|--compress)
+            compress="true"
+            shift 1
+            ;;
+        -g|--gzip)
+            gzip=$2
+            shift 2
+            ;;
 		--)
 			shift
 			break
@@ -77,15 +89,37 @@ while true; do
 	esac
 done
 
-total_lines=$(wc -l < $input)
+echo "***************************************************************"
+echo "Counting lines in '$input'"
+echo "***************************************************************"
+if [[ -z "$compress" ]]; then
+    total_lines=$(wc -l < $input)
+else
+    total_lines=$(pv $input | $gzip -d | wc -l)
+fi
 lines=($total_lines+$splits-1)/$splits #Set number of lines rounding up
+echo Total lines: $total_lines
+echo Lines per chunk: $lines
 
-split -l $lines $input "$input"_split_
+echo rdf2hdtcat.sh $JAVA_OPTIONS
+
+echo "***************************************************************"
+echo "Splitting '$input' in $splits chunks"
+echo "***************************************************************"
+if [[ -z "$compress" ]]; then
+    split -l $lines $input "$input"_split_
+else
+    pv "$input" | $gzip -d | split -l $lines - "$input"_split_ --filter="$gzip > \$FILE.gz"
+fi
 
 echo "***************************************************************"
 echo "Serializing into HDT $splits files using $threads threads"
 echo "***************************************************************"
-echo -n "$input"_split_* | xargs -I{} -d' ' -P$threads $rdf2hdt -rdftype ntriples {} {}_"$splits".hdt
+if [[ -z "$compress" ]]; then
+    echo -n "$input"_split_* | xargs -I{} -d' ' -P$threads bash -c "JAVA_OPTIONS='-Xmx4g' $rdf2hdt -rdftype ntriples {} {}_"$splits".hdt"
+else
+    echo -n "$input"_split_*.gz | sed 's/\.gz\( \|$\)/ /g' | xargs -I{} -d' ' -P$threads bash -c "JAVA_OPTIONS='-Xmx8g' $rdf2hdt -rdftype ntriples <(cat {}.gz | $gzip -d) {}_$splits.hdt"
+fi
 
 for (( i=$splits; i>1; i=i/2 )); do
     echo "***************************************************************"
